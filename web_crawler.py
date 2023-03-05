@@ -13,50 +13,73 @@ class ThreadSafeSet:
         self.set = set()
 
     def add(self, item):
+        """
+        Add an item to the thread-safe set.
+
+        Args:
+            item: The item to add.
+
+        Returns:
+            None.
+        """
         with self.lock:
             self.set.add(item)
 
     def __contains__(self, item):
+        """
+        Check if an item is in the thread-safe set.
+
+        Args:
+            item: The item to search for.
+
+        Returns:
+            True if the item is in the set, False otherwise.
+        """
         with self.lock:
             return item in self.set
 
-"""
-This program recursively crawls web pages starting from a specified URL up to a given depth limit.
-It extracts the textual content of the pages that match a specified regular expression, and passes the data to a user-specified callback function.
+    def __len__(self):
+        """
+        Get the number of items in the thread-safe set.
 
-While crawling, the program only visits URLs that match the specified regular expression and belong to the same domain.
-It keeps track of visited URLs using a thread-safe set to avoid visiting the same URL twice.
-If the page was last modified before the specified time limit, it skips crawling that page.
-The program also introduces a delay between successive crawls.
+        Returns:
+            The number of items in the set.
+        """
+        with self.lock:
+            return len(self.set)
 
-The program takes the following arguments:
-
-    - url: The URL to start the crawl from.
-    - data_handler: A user-defined callback function to process the textual data extracted from the page.
-    - stop_handler: A user-defined callback function to force stop the crawl (optional).
-    - depth: The depth limit of the crawl (default=3).
-    - visited: A thread-safe set to store the URLs already visited (optional).
-    - delay: The delay between successive crawls, in milliseconds (default=1000).
-    - since: The time limit for the last page modification date (optional).
-    - url_regex: A regular expression to filter the URLs to be crawled (optional).
-
-Note: The program ignores any exceptions that occur while crawling and logs them.
-A keyboard interrupt (Ctrl+C) is handled by closing the aiohttp session.
-"""
 async def scrape_website(
     url: str, 
     data_handler: Callable[[str, str, int, bool, bool], bool], 
-    stop_handler: Optional[Callable[[], bool]] = None,
+    stop_handler: Optional[Callable[[str, int, Set[str]], bool]] = None,
     depth: int = 3, 
     visited: Optional[Set[str]] = None, 
     delay: int = 1000, 
     since: Optional[datetime] = None, 
     url_regex: Optional[str] = None
-) -> None:
+) -> None: 
+    """
+    Asynchronously scrape HTML data from a given URL and recursively scrape pages up to a specified depth.
+
+    Args:
+        url: The URL of the website to scrape.
+        data_handler: A callback function that takes the page text, URL, HTTP status code, a boolean indicating success, and a boolean indicating whether the page was successfully scraped, and processes the scrape data.
+        stop_handler: An optional callback function that can be used to stop the scrape.
+            The function takes the current URL, the current depth, and the set of visited URLs as arguments and should return True if the scrape should be stopped, False otherwise.
+        depth: The depth of the recursive scrape (default is 3).
+        visited: A set of URLs that have already been visited (default is None).
+        delay: The delay between requests in milliseconds (default is 1000).
+        since: An optional datetime object specifying the last modified date of the page to scrape.
+        url_regex: An optional regular expression pattern to restrict the URLs to scrape.
+
+    Returns:
+        None.
+    """
 
     # Check if the force stop file exists
-    if stop_handler and stop_handler():
+    if stop_handler and stop_handler(url, depth, visited):
         print("Scraping was forcefully stopped.")
+        return
 
     # Initialize a thread-safe set for visited URLs
     if visited is None:
