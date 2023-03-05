@@ -6,12 +6,9 @@ import os
 from web_crawler import scrape_website
 
 
-def force_to_stop():
-    if os.path.isfile("yahoonews.jsonl"):
-        with open("yahoonews.jsonl", "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            if len(lines) >= 30:
-                return True
+def force_to_stop(url, depth, visited):
+    if visited and len(visited) >= 50:
+        return True
     return False
 
 def write_to_file(page_content, source, status_code, is_success):
