@@ -113,6 +113,22 @@ def extract_page_text(soup: BeautifulSoup) -> str:
     return '\n'.join(lines)
 
 
+def default_link_extractor(page: ScrapedPage) -> List[str]:
+    """
+    Default link extractor:
+    - Collects all <a href> links using page.soup
+    - Resolves to absolute URLs relative to page.url
+    - Keeps only http/https schemes
+    """
+    links: List[str] = []
+    for a in page.soup.find_all('a', href=True):
+        abs_url = urljoin(page.url, a['href'])
+        parsed = urlparse(abs_url)
+        if parsed.scheme in ('http', 'https'):
+            links.append(abs_url)
+    return links
+
+
 async def scrape_website(
     url: str,
     data_handler: Callable[[ScrapedPage], bool],
@@ -122,7 +138,8 @@ async def scrape_website(
     delay: int = 1000,
     since: Optional[datetime] = None,
     url_regex: Optional[str] = None,
-    user_agent: str = DEFAULT_USER_AGENT
+    user_agent: str = DEFAULT_USER_AGENT,
+    link_extractor: Optional[Callable[[ScrapedPage], List[str]]] = None,
 ) -> None:
     """
     Asynchronously scrape HTML data from a given URL and recursively scrape pages up to a specified depth.
@@ -142,6 +159,10 @@ async def scrape_website(
                Naive datetimes will be treated as UTC and normalized to UTC for comparison.
         url_regex: An optional regular expression pattern to restrict the URLs to scrape.
         user_agent: The User-Agent string to use for HTTP requests (default is a polite default).
+        link_extractor: Optional callback to extract links from a page.
+            Signature: (page: ScrapedPage) -> List[str]
+            If omitted, the built-in default_link_extractor is used.
+
     Returns:
         None.
     """
@@ -215,17 +236,29 @@ async def scrape_website(
 
                     # Metadata
                     title = soup.title.string.strip() if soup.title and soup.title.string else None
-                    links: List[str] = []
-                    for a in soup.find_all('a', href=True):
-                        abs_url = urljoin(current_url, a['href'])
-                        parsed = urlparse(abs_url)
-                        if parsed.scheme in ('http', 'https'):
-                            links.append(abs_url)
 
                     # Success for aiohttp (no response.ok)
                     success = 200 <= response.status < 300
 
-                    # Build payload and call handler
+                    # Build a temporary page (links empty) for link_extractor
+                    temp_page = ScrapedPage(
+                        url=current_url,
+                        status=response.status,
+                        success=success,
+                        html=html,
+                        text=page_text,
+                        soup=soup,
+                        headers=dict(response.headers),
+                        last_modified=last_modified_dt,
+                        title=title,
+                        links=[],
+                    )
+
+                    # Links via extractor (default if not provided)
+                    effective_extractor = link_extractor or default_link_extractor
+                    links: List[str] = effective_extractor(temp_page)
+
+                    # Final payload with links populated
                     payload = ScrapedPage(
                         url=current_url,
                         status=response.status,
@@ -236,7 +269,7 @@ async def scrape_website(
                         headers=dict(response.headers),
                         last_modified=last_modified_dt,
                         title=title,
-                        links=links
+                        links=links,
                     )
 
                     if not data_handler(payload):
