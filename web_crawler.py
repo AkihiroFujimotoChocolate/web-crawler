@@ -1,11 +1,18 @@
-from typing import Optional, Set, Callable
+from typing import Optional, Set, Callable, Dict, List
 import aiohttp
 import asyncio
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from urllib.parse import urlparse, urljoin
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from dataclasses import dataclass
 import re
 import threading
+
+
+# Polite default User-Agent (helps avoid blocks on some sites)
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible)"
+
 
 class ThreadSafeSet:
     def __init__(self):
@@ -48,88 +55,210 @@ class ThreadSafeSet:
         with self.lock:
             return len(self.set)
 
+
+@dataclass
+class ScrapedPage:
+    """
+    Structured payload passed to data_handler for flexible processing.
+    """
+    url: str
+    status: int
+    success: bool
+    html: str
+    text: str
+    soup: BeautifulSoup
+    headers: Dict[str, str]
+    last_modified: Optional[datetime]
+    title: Optional[str]
+    links: List[str]
+
+
+def extract_page_text(soup: BeautifulSoup) -> str:
+    """
+    Extract visible, structured text from a BeautifulSoup document.
+
+    - Removes scripts/styles/noscript/template/svg/iframe
+    - Removes common boilerplate sections (nav/footer/header/aside)
+    - Inserts <img alt> into text (or drops the image if no alt)
+    - Removes HTML comments
+    - Preserves structure with newlines and normalizes whitespace per line
+    """
+    # Remove non-content tags
+    for tag in soup(['script', 'style', 'noscript', 'template', 'svg', 'iframe']):
+        tag.decompose()
+
+    # Remove common boilerplate sections
+    for tag in soup.find_all(['nav', 'footer', 'header', 'aside']):
+        tag.decompose()
+
+    # Replace images with their alt text (or drop if no alt)
+    for img in soup.find_all('img'):
+        alt = (img.get('alt') or '').strip()
+        if alt:
+            img.replace_with(alt)
+        else:
+            img.decompose()
+
+    # Remove comments
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        c.extract()
+
+    # Get text with structure and normalize
+    raw = soup.get_text(separator='\n', strip=True)
+    lines = []
+    for line in raw.splitlines():
+        norm = re.sub(r'\s+', ' ', line).strip()
+        if norm:
+            lines.append(norm)
+    return '\n'.join(lines)
+
+
 async def scrape_website(
-    url: str, 
-    data_handler: Callable[[str, str, int, bool, bool], bool], 
+    url: str,
+    data_handler: Callable[[ScrapedPage], bool],
     stop_handler: Optional[Callable[[str, int, Set[str]], bool]] = None,
-    depth: int = 3, 
-    visited: Optional[Set[str]] = None, 
-    delay: int = 1000, 
-    since: Optional[datetime] = None, 
-    url_regex: Optional[str] = None
-) -> None: 
+    depth: int = 3,
+    visited: Optional[Set[str]] = None,
+    delay: int = 1000,
+    since: Optional[datetime] = None,
+    url_regex: Optional[str] = None,
+    user_agent: str = DEFAULT_USER_AGENT
+) -> None:
     """
     Asynchronously scrape HTML data from a given URL and recursively scrape pages up to a specified depth.
 
     Args:
         url: The URL of the website to scrape.
-        data_handler: A callback function that takes the page text, URL, HTTP status code, a boolean indicating success, and a boolean indicating whether the page was successfully scraped, and processes the scrape data.
+        data_handler: A callback function that takes:
+            (page: ScrapedPage) -> bool
+            and returns True to continue or False to stop recursion.
         stop_handler: An optional callback function that can be used to stop the scrape.
-            The function takes the current URL, the current depth, and the set of visited URLs as arguments and should return True if the scrape should be stopped, False otherwise.
+            The function takes the current URL, the current depth, and the set of visited URLs as arguments
+            and should return True if the scrape should be stopped, False otherwise.
         depth: The depth of the recursive scrape (default is 3).
         visited: A set of URLs that have already been visited (default is None).
         delay: The delay between requests in milliseconds (default is 1000).
-        since: An optional datetime object specifying the last modified date of the page to scrape.
+        since: An optional datetime used to filter pages older than this Last-Modified.
+               Naive datetimes will be treated as UTC and normalized to UTC for comparison.
         url_regex: An optional regular expression pattern to restrict the URLs to scrape.
-
+        user_agent: The User-Agent string to use for HTTP requests (default is a polite default).
     Returns:
         None.
     """
 
-    # Check if the force stop file exists
-    if stop_handler and stop_handler(url, depth, visited):
-        print("Scraping was forcefully stopped.")
-        return
-
     # Initialize a thread-safe set for visited URLs
-    if visited is None:
+    if visited is None or not hasattr(visited, "add"):
         visited = ThreadSafeSet()
-    visited.add(url)
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Get HTML from the URL
-            async with session.get(url) as response:
-                # Raise an exception if the response status code is not in the 2xx range
-                response.raise_for_status()
+    # Normalize 'since' to timezone-aware UTC to safely compare with HTTP dates
+    since_utc: Optional[datetime] = None
+    if since is not None:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        since_utc = since.astimezone(timezone.utc)
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+    # Create one shared session per crawl for performance (reuse connections)
+    timeout = aiohttp.ClientTimeout(total=30)  # adjust as needed
+    headers = {"User-Agent": user_agent}
 
-                # Check the last modified date of the page
-                last_modified = response.headers.get("Last-Modified")
-                if last_modified:
-                    last_modified_date = datetime.strptime(last_modified, '%a, %d %b %Y %H:%M:%S %Z')
-                    if since and last_modified_date < since:
-                        return
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
 
-                # Extract all text from the page
-                page_text = soup.get_text().strip()
-
-                # Call the callback function with the extracted data
-                if not data_handler(page_text, url, response.status, response.ok):
+        async def _scrape(current_url: str, current_depth: int):
+            # Stop check (pass a plain set to stop_handler when possible)
+            if stop_handler:
+                try:
+                    visited_for_stop: Set[str] = visited.set if hasattr(visited, "set") else visited  # type: ignore
+                except Exception:
+                    visited_for_stop = set()
+                if stop_handler(current_url, current_depth, visited_for_stop):
+                    print("Scraping was forcefully stopped.")
                     return
 
-                # Recursively scrape pages up to the specified depth
-                if depth > 1:
-                    for link in soup.find_all('a'):
-                        next_url = link.get("href")
-                        if next_url is not None:
-                            # Convert the relative URL to an absolute URL
-                            next_url = urljoin(url, next_url)
-                            # Check if the URL matches the regular expression
+            if current_url in visited:
+                return
+            visited.add(current_url)
+
+            try:
+                async with session.get(current_url) as response:
+                    # Raise if not 2xx
+                    response.raise_for_status()
+
+                    # Skip non-HTML responses early
+                    if response.content_type not in ("text/html", "application/xhtml+xml"):
+                        return
+
+                    # Read HTML
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "html.parser")
+
+                    # Parse Last-Modified robustly (RFC 2822/5322) and normalize to UTC
+                    last_modified_dt: Optional[datetime] = None
+                    last_modified = response.headers.get("Last-Modified")
+                    if last_modified:
+                        try:
+                            dt = parsedate_to_datetime(last_modified)
+                            if dt is not None:
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                else:
+                                    dt = dt.astimezone(timezone.utc)
+                                last_modified_dt = dt
+                        except Exception:
+                            last_modified_dt = None
+
+                        # Skip if page older than 'since'
+                        if since_utc and last_modified_dt and last_modified_dt < since_utc:
+                            return
+
+                    # Extract text
+                    page_text = extract_page_text(soup)
+
+                    # Metadata
+                    title = soup.title.string.strip() if soup.title and soup.title.string else None
+                    links: List[str] = []
+                    for a in soup.find_all('a', href=True):
+                        abs_url = urljoin(current_url, a['href'])
+                        parsed = urlparse(abs_url)
+                        if parsed.scheme in ('http', 'https'):
+                            links.append(abs_url)
+
+                    # Success for aiohttp (no response.ok)
+                    success = 200 <= response.status < 300
+
+                    # Build payload and call handler
+                    payload = ScrapedPage(
+                        url=current_url,
+                        status=response.status,
+                        success=success,
+                        html=html,
+                        text=page_text,
+                        soup=soup,
+                        headers=dict(response.headers),
+                        last_modified=last_modified_dt,
+                        title=title,
+                        links=links
+                    )
+
+                    if not data_handler(payload):
+                        return
+
+                    # Recurse
+                    if current_depth > 1:
+                        origin_host = urlparse(current_url).netloc
+                        for next_url in links:
+                            # Regex restriction
                             if url_regex is not None and not re.match(url_regex, next_url):
                                 continue
-                            # Check if the URL is in the same domain and has not been visited yet
-                            if urlparse(next_url).netloc == urlparse(url).netloc and next_url not in visited:
-                                await scrape_website(next_url, data_handler, stop_handler, depth=depth-1, visited=visited, delay=delay, since=since, url_regex=url_regex)
+                            # Same-domain and not visited
+                            if urlparse(next_url).netloc == origin_host and next_url not in visited:
+                                await _scrape(next_url, current_depth - 1)
 
-                # Sleep for the specified number of milliseconds
-                await asyncio.sleep(delay/1000)
-        except KeyboardInterrupt:
-            # Handle keyboard interrupt (Ctrl+C)
-            await session.close()
-            raise
-        except Exception as e:
-            # Log and ignore any exceptions that occur while scraping
-            print(f"An exception occurred while scraping {url}: {e}")
+                    # Politeness delay
+                    await asyncio.sleep(delay / 1000)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # Log and continue
+                print(f"An exception occurred while scraping {current_url}: {e}")
+
+        await _scrape(url, depth)
