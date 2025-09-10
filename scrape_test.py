@@ -20,7 +20,7 @@ def write_to_file(page_content, source, status_code, is_success):
 async def scrape_yahoonews():
     url = "https://news.yahoo.co.jp/"
     since = datetime.now() - timedelta(days=2)
-    url_regex = "https:\/\/news\.yahoo\.co\.jp\/articles\/[^\/]+\/?$"
+    url_regex = r"https://news\.yahoo\.co\.jp/articles/[^/]+/?$"
     await scrape_website(
         url=url,
         data_handler=write_to_file,
@@ -31,5 +31,4 @@ async def scrape_yahoonews():
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(scrape_yahoonews())
+    asyncio.run(scrape_yahoonews())
