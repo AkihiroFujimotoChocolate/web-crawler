@@ -5,7 +5,7 @@ Asynchronous crawler for extracting text content from web pages.
 - Depth-limited recursion
 - Optional URL filtering (regex)
 - Optional “since” filtering via HTTP `Last-Modified`
-- Pluggable callbacks (`data_handler`, `stop_handler`)
+- Pluggable callbacks (`data_handler`, `stop_handler`, `link_extractor`)
 
 ---
 
@@ -67,4 +67,38 @@ pip install -r requirements.txt
 4) Run the sample script
 ```shell
 python scrape_test.py
+```
+
+---
+
+## Custom link extractor
+
+You can customize how links are extracted from each page by providing `link_extractor`.
+If omitted, a built-in default extractor is used (collects all `<a href>` links, resolves to absolute URLs, and keeps only http/https).
+
+Signature:
+```python
+def link_extractor(page: ScrapedPage) -> list[str]: ...
+```
+
+Example:
+
+```python
+from urllib.parse import urlparse, urljoin
+from web_crawler import scrape_website, ScrapedPage
+
+def only_article_links(page: ScrapedPage) -> list[str]:
+    links: list[str] = []
+    # Example: keep only URLs containing "/articles/"
+    for a in page.soup.select("a[href]"):
+        href = a["href"]
+        if "/articles/" not in href:
+            continue
+        abs_url = urljoin(page.url, href)
+        if urlparse(abs_url).scheme in ("http", "https"):
+            links.append(abs_url)
+    return links
+
+# Use it:
+# await scrape_website(url, data_handler=..., link_extractor=only_article_links)
 ```
