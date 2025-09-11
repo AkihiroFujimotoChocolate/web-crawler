@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup, Comment
 from urllib.parse import urlparse, urljoin
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import threading
 
@@ -47,6 +47,7 @@ class ScrapedPage:
     last_modified: Optional[datetime]
     title: Optional[str]
     links: List[str]
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 def extract_page_text(soup: BeautifulSoup) -> str:
