@@ -109,7 +109,6 @@ def only_article_links(page: ScrapedPage) -> list[str]:
 
 You can optionally fetch “rendered” HTML using Playwright, which helps with SPA/JS-heavy pages. This is an additive feature: the default `aiohttp`-based crawler continues to work as-is. Playwright is only needed when you explicitly use it.
 
-- No lxml is used; BeautifulSoup runs with the built-in `html.parser`.
 - Playwright and a browser runtime (e.g., Chromium) are optional dependencies.
 
 ### Install (only if you use Playwright)
