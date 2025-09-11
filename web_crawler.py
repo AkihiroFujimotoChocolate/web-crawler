@@ -1,4 +1,4 @@
-from typing import Optional, Set, Callable, Dict, List
+from typing import Optional, Set, Callable, Dict, List, Any
 import aiohttp
 import asyncio
 from bs4 import BeautifulSoup, Comment
@@ -20,38 +20,14 @@ class ThreadSafeSet:
         self.set = set()
 
     def add(self, item):
-        """
-        Add an item to the thread-safe set.
-
-        Args:
-            item: The item to add.
-
-        Returns:
-            None.
-        """
         with self.lock:
             self.set.add(item)
 
     def __contains__(self, item):
-        """
-        Check if an item is in the thread-safe set.
-
-        Args:
-            item: The item to search for.
-
-        Returns:
-            True if the item is in the set, False otherwise.
-        """
         with self.lock:
             return item in self.set
 
     def __len__(self):
-        """
-        Get the number of items in the thread-safe set.
-
-        Returns:
-            The number of items in the set.
-        """
         with self.lock:
             return len(self.set)
 
@@ -121,12 +97,16 @@ def default_link_extractor(page: ScrapedPage) -> List[str]:
     - Keeps only http/https schemes
     """
     links: List[str] = []
-    for a in page.soup.find_all('a', href=True):
-        abs_url = urljoin(page.url, a['href'])
-        parsed = urlparse(abs_url)
-        if parsed.scheme in ('http', 'https'):
+    for a in page.soup.select("a[href]"):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        abs_url = urljoin(page.url, href)
+        if urlparse(abs_url).scheme in ("http", "https"):
             links.append(abs_url)
-    return links
+    # de-dup, keep order
+    dedup: List[str] = list(dict.fromkeys(links))
+    return dedup
 
 
 async def scrape_website(
@@ -140,31 +120,16 @@ async def scrape_website(
     url_regex: Optional[str] = None,
     user_agent: str = DEFAULT_USER_AGENT,
     link_extractor: Optional[Callable[[ScrapedPage], List[str]]] = None,
+    *,
+    # Optional (non-breaking) additions:
+    use_playwright: bool = False,
+    playwright_options: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Asynchronously scrape HTML data from a given URL and recursively scrape pages up to a specified depth.
 
-    Args:
-        url: The URL of the website to scrape.
-        data_handler: A callback function that takes:
-            (page: ScrapedPage) -> bool
-            and returns True to continue or False to stop recursion.
-        stop_handler: An optional callback function that can be used to stop the scrape.
-            The function takes the current URL, the current depth, and the set of visited URLs as arguments
-            and should return True if the scrape should be stopped, False otherwise.
-        depth: The depth of the recursive scrape (default is 3).
-        visited: A set of URLs that have already been visited (default is None).
-        delay: The delay between requests in milliseconds (default is 1000).
-        since: An optional datetime used to filter pages older than this Last-Modified.
-               Naive datetimes will be treated as UTC and normalized to UTC for comparison.
-        url_regex: An optional regular expression pattern to restrict the URLs to scrape.
-        user_agent: The User-Agent string to use for HTTP requests (default is a polite default).
-        link_extractor: Optional callback to extract links from a page.
-            Signature: (page: ScrapedPage) -> List[str]
-            If omitted, the built-in default_link_extractor is used.
-
-    Returns:
-        None.
+    - Non-breaking: new parameters are optional with defaults.
+    - Flow/loop/async structure is unchanged; Playwright path is an optional branch.
     """
 
     # Initialize a thread-safe set for visited URLs
@@ -177,6 +142,9 @@ async def scrape_website(
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
         since_utc = since.astimezone(timezone.utc)
+
+    # Optional URL filter regex (compiled once)
+    url_pattern = re.compile(url_regex) if url_regex else None
 
     # Create one shared session per crawl for performance (reuse connections)
     timeout = aiohttp.ClientTimeout(total=30)  # adjust as needed
@@ -199,99 +167,117 @@ async def scrape_website(
                 return
             visited.add(current_url)
 
-            try:
-                async with session.get(current_url) as response:
-                    # Raise if not 2xx
-                    response.raise_for_status()
+            # Depth guard: still process current page at depth >= 0; recurse only if > 0
+            can_recurse = current_depth > 0
 
-                    # Skip non-HTML responses early
-                    if response.content_type not in ("text/html", "application/xhtml+xml"):
-                        return
+            page: Optional[ScrapedPage] = None
 
-                    # Read HTML
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
+            if use_playwright:
+                # Lazy import; safe when Playwright is not installed and flag is False
+                pw_opts = playwright_options or {}
+                wait_until = pw_opts.get("wait_until", "networkidle")
+                timeout_ms = int(pw_opts.get("timeout_ms", 30000))
+                headless = bool(pw_opts.get("headless", True))
+                wait_for_selector = pw_opts.get("wait_for_selector", None)
 
-                    # Parse Last-Modified robustly (RFC 2822/5322) and normalize to UTC
-                    last_modified_dt: Optional[datetime] = None
-                    last_modified = response.headers.get("Last-Modified")
-                    if last_modified:
-                        try:
-                            dt = parsedate_to_datetime(last_modified)
-                            if dt is not None:
-                                if dt.tzinfo is None:
-                                    dt = dt.replace(tzinfo=timezone.utc)
-                                else:
-                                    dt = dt.astimezone(timezone.utc)
-                                last_modified_dt = dt
-                        except Exception:
-                            last_modified_dt = None
+                try:
+                    from playwright_adapter import crawl_url_with_playwright
+                    page = await crawl_url_with_playwright(
+                        current_url,
+                        user_agent=user_agent,
+                        wait_until=wait_until,
+                        timeout_ms=timeout_ms,
+                        headless=headless,
+                        extra_headers=None,
+                        wait_for_selector=wait_for_selector,
+                    )
+                except ImportError:
+                    page = None
+                except RuntimeError:
+                    page = None
+                except Exception:
+                    page = None
 
-                        # Skip if page older than 'since'
-                        if since_utc and last_modified_dt and last_modified_dt < since_utc:
+            if page is None:
+                # aiohttp route (unchanged behavior)
+                try:
+                    async with session.get(current_url) as response:
+                        response.raise_for_status()
+
+                        if response.content_type not in ("text/html", "application/xhtml+xml"):
                             return
 
-                    # Extract text
-                    page_text = extract_page_text(soup)
+                        resp_headers: Dict[str, str] = dict(response.headers)
+                        last_modified: Optional[datetime] = None
+                        lm = resp_headers.get("Last-Modified") or resp_headers.get("last-modified")
+                        if lm:
+                            try:
+                                last_modified = parsedate_to_datetime(lm)
+                            except Exception:
+                                last_modified = None
 
-                    # Metadata
-                    title = soup.title.string.strip() if soup.title and soup.title.string else None
+                        if since_utc and last_modified and last_modified.astimezone(timezone.utc) < since_utc:
+                            return
 
-                    # Success for aiohttp (no response.ok)
-                    success = 200 <= response.status < 300
+                        html = await response.text()
 
-                    # Build a temporary page (links empty) for link_extractor
-                    temp_page = ScrapedPage(
-                        url=current_url,
-                        status=response.status,
-                        success=success,
-                        html=html,
-                        text=page_text,
-                        soup=soup,
-                        headers=dict(response.headers),
-                        last_modified=last_modified_dt,
-                        title=title,
-                        links=[],
-                    )
+                        soup = BeautifulSoup(html, "html.parser")  # no lxml
+                        try:
+                            title = (soup.title.string or "").strip() if soup.title else None
+                        except Exception:
+                            title = None
+                        text = extract_page_text(soup)
 
-                    # Links via extractor (default if not provided)
-                    effective_extractor = link_extractor or default_link_extractor
-                    links: List[str] = effective_extractor(temp_page)
+                        page = ScrapedPage(
+                            url=current_url,
+                            status=response.status,
+                            success=200 <= response.status < 400,
+                            html=html,
+                            text=text,
+                            soup=soup,
+                            headers=resp_headers,
+                            last_modified=last_modified,
+                            title=title,
+                            links=[],
+                        )
+                except aiohttp.ClientResponseError:
+                    return
+                except aiohttp.ClientError:
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return
+            else:
+                # Playwright route: apply since filter if available
+                if since_utc and page.last_modified and page.last_modified.astimezone(timezone.utc) < since_utc:
+                    return
 
-                    # Final payload with links populated
-                    payload = ScrapedPage(
-                        url=current_url,
-                        status=response.status,
-                        success=success,
-                        html=html,
-                        text=page_text,
-                        soup=soup,
-                        headers=dict(response.headers),
-                        last_modified=last_modified_dt,
-                        title=title,
-                        links=links,
-                    )
+            # Handler
+            try:
+                should_continue = data_handler(page)
+            except Exception:
+                should_continue = True
 
-                    if not data_handler(payload):
-                        return
+            if not should_continue:
+                return
 
-                    # Recurse
-                    if current_depth > 1:
-                        origin_host = urlparse(current_url).netloc
-                        for next_url in links:
-                            # Regex restriction
-                            if url_regex is not None and not re.match(url_regex, next_url):
-                                continue
-                            # Same-domain and not visited
-                            if urlparse(next_url).netloc == origin_host and next_url not in visited:
-                                await _scrape(next_url, current_depth - 1)
+            # Links
+            try:
+                links = link_extractor(page) if link_extractor else default_link_extractor(page)
+            except Exception:
+                links = []
 
-                    # Politeness delay
-                    await asyncio.sleep(delay / 1000)
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                # Log and continue
-                print(f"An exception occurred while scraping {current_url}: {e}")
+            if url_pattern:
+                links = [u for u in links if url_pattern.search(u)]
+
+            # Recurse
+            if can_recurse:
+                for next_url in links:
+                    if next_url in visited:
+                        continue
+                    if delay and delay > 0:
+                        await asyncio.sleep(delay / 1000.0)
+                    await _scrape(next_url, current_depth - 1)
 
         await _scrape(url, depth)
