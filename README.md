@@ -40,7 +40,7 @@ python3.13 -m venv .venv
 pip install -r requirements.txt
 ```
 
-4) Run the sample script
+4) Run the sample script (aiohttp route)
 ```powershell
 python scrape_test.py
 ```
@@ -64,7 +64,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4) Run the sample script
+4) Run the sample script (aiohttp route)
 ```shell
 python scrape_test.py
 ```
@@ -102,3 +102,59 @@ def only_article_links(page: ScrapedPage) -> list[str]:
 # Use it:
 # await scrape_website(url, data_handler=..., link_extractor=only_article_links)
 ```
+
+---
+
+## Optional: Playwright-based rendering (JS-required pages)
+
+You can optionally fetch “rendered” HTML using Playwright, which helps with SPA/JS-heavy pages. This is an additive feature: the default `aiohttp`-based crawler continues to work as-is. Playwright is only needed when you explicitly use it.
+
+- No lxml is used; BeautifulSoup runs with the built-in `html.parser`.
+- Playwright and a browser runtime (e.g., Chromium) are optional dependencies.
+
+### Install (only if you use Playwright)
+
+```bash
+pip install -r requirements-playwright.txt
+playwright install chromium
+# On Linux (recommended to include OS deps)
+# playwright install --with-deps chromium
+```
+
+Notes:
+- You may also install `firefox` or `webkit` instead of `chromium`.
+- If Playwright is not installed, everything still works as long as you don’t call the Playwright adapter.
+
+### Quick start (Playwright route)
+
+```bash
+python scrape_test_playwright.py
+```
+
+This script will:
+- Navigate to the Yahoo News top page with Playwright
+- Extract the rendered HTML, page title, links, and visible text (same extraction logic as the default path)
+- Apply the same filters as `scrape_test.py` (since within last 2 days and Yahoo article URL pattern)
+
+### Integrate with your crawler (minimal change)
+
+If you want to switch to Playwright only for certain pages, enable the flag:
+
+```python
+await scrape_website(
+  url=...,
+  data_handler=...,
+  use_playwright=True,
+  playwright_options={
+    "wait_until": "networkidle",
+    "timeout_ms": 30000,
+    "headless": True,
+    # "wait_for_selector": "article",
+  },
+)
+```
+
+Design notes:
+- Delayed import: Playwright is imported inside functions, so environments without Playwright/Chromium are unaffected unless you enable it.
+- Headers: Response headers are accessed in a case-insensitive way (`last-modified`/`Last-Modified`).
+- Concurrency: Playwright is heavier than aiohttp; limit parallelism when using it.
